@@ -1,5 +1,5 @@
 import os
-from refund_store import init_db, insert_refund
+from refund_store import init_db, insert_refund, update_status, get_refund
 from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -10,6 +10,7 @@ load_dotenv()
 
 
 FINANCE_CHANNEL = os.getenv("FINANCE_CHANNEL", "#finance")
+APPROVER_USER_IDS = set(u.strip() for u in os.getenv("APPROVER_USER_IDS","").split(",") if u.strip())
 
 app = App(
     token = os.environ["SLACK_TOKEN"],
@@ -34,8 +35,50 @@ def handle_submit(ack, body, client, view):
     
     client.chat_postMessage(
         channel=FINANCE_CHANNEL,
-        text=f"New refund request #{req_id} - order `{order_id}` - {amount} TRY (PENDING)"
+        text=f"New refund request #{req_id} - order `{order_id}` - {amount} TRY (PENDING)",
+        blocks=[
+            {"type":"section","text":{"type":"mrkdwn","text":f"*Refund #{req_id}*\n• Order `{order_id}`\n• Amount *{amount} TRY*\n_Status: PENDING_"}},
+            {"type":"actions","elements":[
+                {"type":"button","text":{"type":"plain_text","text":"Approve"},"style":"primary","value":str(req_id),"action_id":"refund_approve"},
+                {"type":"button","text":{"type":"plain_text","text":"Reject"},"style":"danger","value":str(req_id),"action_id":"refund_reject"}
+            ]}
+        ]
     )
+
+
+@app.action("refund_approve")
+def on_approve(ack, body, action, client, respond):
+    ack()
+    user = body["user"]["id"]
+    if user not in APPROVER_USER_IDS:
+        return respond(respond_type="ephemeral",text="You are not authorized for this task")
+    
+    #print(action)
+    req_id = int(action["value"])
+    row = get_refund(req_id)
+    if not row:
+        return respond(text=f"Refund #{req_id} not found" )
+    update_status(req_id, "APPROVED")
+
+    channel = body["container"]["channel_id"]
+    client.chat_postMessage(channel=channel, text=f"Refund #{req_id} APPROVED by <@{user}>")
+
+
+@app.action("refund_reject")
+def on_reject(ack, body, action, client, respond):    
+    ack()
+    user = body["user"]["id"]
+    if user not in APPROVER_USER_IDS:
+        return respond(respond_type="ephemeral", text="You are not authorized for this task")
+    
+    req_id = int(action["value"])
+    row = get_refund(req_id)
+    if not row:
+        return respond(text=f"Refund #{req_id} not found" )
+    update_status(req_id, "REJECTED")
+
+    channel = body["container"]["channel_id"]
+    client.chat_postMessage(channel=channel, text=f"Refund #{req_id} REJECTED by <@{user}>")
 
 
 @app.command("/refund")
