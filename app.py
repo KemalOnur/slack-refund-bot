@@ -4,7 +4,24 @@ from refund_service import RefundService
 from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from dotenv import load_dotenv  
+from dotenv import load_dotenv
+import structlog, uuid
+
+def configure_logging():
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso", key="@timestamp"),
+            structlog.processors.add_log_level,
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer()
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(20),
+        cache_logger_on_first_use=True,
+    )
+
+configure_logging()
+log = structlog.get_logger()
 
 
 load_dotenv()
@@ -35,29 +52,65 @@ def render_refund_blocks(req_id:int, order_id:str, amount:float, status:str, dec
 
 @app.view("refund_submit")
 def handle_submit(ack, body, client, view):
-    ack()
+    ack()  
 
-
+    
     vals = view["state"]["values"]
-    order_id = vals["order"]["order_id"]["value"].strip()
-    amount = float(vals["amount"]["amount"]["value"])
-    reason = vals["reason"]["reason"]["value"].strip()
-    user_id = body["user"]["id"]
+    order_id   = vals["order"]["order_id"]["value"].strip()
+    amount_str = vals["amount"]["amount"]["value"].strip()
+    reason     = vals["reason"]["reason"]["value"].strip()
+    user_id    = body["user"]["id"]
+    trace_id   = view.get("private_metadata")
+
+    
+    log.info(
+        "refund.submit.received",
+        action="modal_submit",
+        slack_user=user_id,
+        order_id=order_id,
+        amount_str=amount_str,
+        trace_id=trace_id,
+    )
+
+    
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        amount = 0.0  
 
     init_db()
-    req_id = insert_refund(order_id=order_id, amount=amount, currency="TRY",
-                           reason=reason, requested_by=user_id)
-    
+    req_id = insert_refund(
+        order_id=order_id,
+        amount=amount,
+        currency="TRY",
+        reason=reason,
+        requested_by=user_id,
+    )
+
+    log.info(
+        "refund.submit.persisted",
+        refund_request_id=req_id,
+        order_id=order_id,
+        amount=amount,
+        currency="TRY",
+        status="PENDING",
+        trace_id=trace_id,
+    )
+
     client.chat_postMessage(
         channel=FINANCE_CHANNEL,
-        text=f"Refund #{req_id} created PENDING",
-        blocks=render_refund_blocks(req_id, order_id, amount, "PENDING")
+        text=f"Refund #{req_id} created (PENDING)",
+        blocks=render_refund_blocks(req_id, order_id, amount, "PENDING"),
     )
+
 
 
 @app.action("refund_approve")
 def on_approve(ack, body, action, client, respond):
     ack()
+
+    
+
     user = body["user"]["id"]
     if user not in APPROVER_USER_IDS:
         return respond(respond_type="ephemeral",text="You are not authorized for this task")
@@ -68,6 +121,11 @@ def on_approve(ack, body, action, client, respond):
     if not row:
         return respond(text=f"Refund #{req_id} not found" )
     
+    log.info("refund.approve.clicked",
+             action="approve",
+             slack_user=user,
+             refund_request_id=req_id)
+    
 
     svc = RefundService()
     ok, ext_id, err = svc.refund(order_id=row[1], amount=row[2], currency=row[3], reason="")
@@ -76,6 +134,9 @@ def on_approve(ack, body, action, client, respond):
     ts      = body["message"]["ts"]
 
     if ok:
+        log.info("refund.approve.succeeded",
+                 refund_request_id=req_id,
+                 external_refund_id=ext_id)
         update_status(req_id, "SUCCEEDED")
         client.chat_update(
             channel=channel,
@@ -84,6 +145,9 @@ def on_approve(ack, body, action, client, respond):
             blocks=render_refund_blocks(req_id, row[1], row[2], "SUCCEEDED", decided_by=user)
         )
     else:
+        log.info("refund.approve.failed",
+                 refund_request_id=req_id,
+                 error=err)
         update_status(req_id, "FAILED")
         client.chat_update(
             channel=channel,
@@ -91,12 +155,19 @@ def on_approve(ack, body, action, client, respond):
             text=f"Refund #{req_id} FAILED",
             blocks=render_refund_blocks(req_id, row[1], row[2], "FAILED", decided_by=user)
         )
+    
+    log.info("refund.message.updated",
+             refund_request_id=req_id,
+             new_status=("SUCCEEDED" if ok else "FAILED"))
 
 
 
 @app.action("refund_reject")
 def on_reject(ack, body, action, client, respond):    
     ack()
+
+    
+
     user = body["user"]["id"]
     if user not in APPROVER_USER_IDS:
         return respond(respond_type="ephemeral", text="You are not authorized for this task")
@@ -106,7 +177,16 @@ def on_reject(ack, body, action, client, respond):
     if not row:
         return respond(text=f"Refund #{req_id} not found" )
     
+    log.info("refund.reject.clicked",
+             action="reject",
+             slack_user=user,
+             refund_request_id=req_id)
+    
     update_status(req_id, "REJECTED")
+
+    log.info("refund.message.updated",
+             refund_request_id=req_id,
+             new_status="REJECTED")
 
     channel = body["container"]["channel_id"]
     ts      = body["message"]["ts"]
@@ -120,34 +200,66 @@ def on_reject(ack, body, action, client, respond):
 
 
 @app.command("/refund")
-def refund_cmd(ack,body,command, client):
+def refund_cmd(ack, body, command, client):
     ack()
-    parts = command.get("text","").split(maxsplit=2)
+
+    # korelasyon id + temel log
+    trace_id = str(uuid.uuid4())
+    log.info("refund.cmd.received",
+             action="slash",
+             slack_user=body["user_id"],
+             text=command.get("text", ""),
+             trace_id=trace_id)
+
+    # komut metnini modal'a ön-doldurmak için parse et
+    parts = command.get("text", "").split(maxsplit=2)
     order_id = parts[0] if len(parts) > 0 else ""
-    amount = parts[1] if len(parts) > 1 else ""
-    reason = parts[2] if len(parts) > 2 else ""
+    amount   = parts[1] if len(parts) > 1 else ""
+    reason   = parts[2] if len(parts) > 2 else ""
 
-    client.views_open(
-        trigger_id = body["trigger_id"],
-        view={
-            "type": "modal",
-            "callback_id": "refund_submit",
-            "title": {"type": "plain_text", "text": "Refund"},
-            "submit": {"type": "plain_text", "text": "Submit"},
-            "blocks": [
-                {"type": "input", "block_id":"order",
-                 "label": {"type":"plain_text","text":"Order ID"},
-                 "element":{"type":"plain_text_input","action_id":"order_id","initial_value":order_id}},
-                {"type": "input", "block_id":"amount",
-                 "label":{"type":"plain_text","text":"Amount (TRY)"},
-                 "element":{"type":"plain_text_input","action_id":"amount","initial_value":amount}},
-                {"type":"input","block_id":"reason",
-               "label":{"type":"plain_text","text":"Reason"},
-               "element":{"type":"plain_text_input","action_id":"reason","initial_value":reason,"multiline":True}}
-            ]
+    # TEK bir views_open çağrısı, zorunlu alanlarla
+    modal_view = {
+        "type": "modal",
+        "callback_id": "refund_submit",
+        "private_metadata": trace_id,
+        "title": {"type": "plain_text", "text": "Refund"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "order",
+                "label": {"type": "plain_text", "text": "Order ID"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "order_id",
+                    "initial_value": str(order_id)
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "amount",
+                "label": {"type": "plain_text", "text": "Amount (TRY)"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "amount",
+                    "initial_value": str(amount)
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "reason",
+                "label": {"type": "plain_text", "text": "Reason"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reason",
+                    "initial_value": str(reason),
+                    "multiline": True
+                }
+            }
+        ]
+    }
 
-        }
-    )
+    client.views_open(trigger_id=body["trigger_id"], view=modal_view)
 
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
