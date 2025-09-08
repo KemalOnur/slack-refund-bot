@@ -1,5 +1,6 @@
 import os
 from refund_store import init_db, insert_refund, update_status, get_refund
+from refund_service import RefundService
 from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -16,6 +17,20 @@ app = App(
     token = os.environ["SLACK_TOKEN"],
     signing_secret=os.environ["SLACK_SIGNING_SECRET"],
 )
+
+
+
+def render_refund_blocks(req_id:int, order_id:str, amount:float, status:str, decided_by:str|None=None):     
+    header = {"type":"section","text":{"type":"mrkdwn","text":f"*Refund #{req_id}*\n• Order `{order_id}`\n• Amount *{amount} TRY*\n_Status: *{status}*_" }}
+    if status == "PENDING":
+        actions = {"type":"actions","elements":[
+            {"type":"button","text":{"type":"plain_text","text":"Approve"},"style":"primary","value":str(req_id),"action_id":"refund_approve"},
+            {"type":"button","text":{"type":"plain_text","text":"Reject"},"style":"danger","value":str(req_id),"action_id":"refund_reject"}
+        ]}
+        return [header, actions]
+    decided = {"type":"context","elements":[{"type":"mrkdwn","text":f"Decided by <@{decided_by}>" }]} if decided_by else None
+    return [header] + ([decided] if decided else [])
+
 
 
 @app.view("refund_submit")
@@ -35,14 +50,8 @@ def handle_submit(ack, body, client, view):
     
     client.chat_postMessage(
         channel=FINANCE_CHANNEL,
-        text=f"New refund request #{req_id} - order `{order_id}` - {amount} TRY (PENDING)",
-        blocks=[
-            {"type":"section","text":{"type":"mrkdwn","text":f"*Refund #{req_id}*\n• Order `{order_id}`\n• Amount *{amount} TRY*\n_Status: PENDING_"}},
-            {"type":"actions","elements":[
-                {"type":"button","text":{"type":"plain_text","text":"Approve"},"style":"primary","value":str(req_id),"action_id":"refund_approve"},
-                {"type":"button","text":{"type":"plain_text","text":"Reject"},"style":"danger","value":str(req_id),"action_id":"refund_reject"}
-            ]}
-        ]
+        text=f"Refund #{req_id} created PENDING",
+        blocks=render_refund_blocks(req_id, order_id, amount, "PENDING")
     )
 
 
@@ -58,10 +67,31 @@ def on_approve(ack, body, action, client, respond):
     row = get_refund(req_id)
     if not row:
         return respond(text=f"Refund #{req_id} not found" )
-    update_status(req_id, "APPROVED")
+    
+
+    svc = RefundService()
+    ok, ext_id, err = svc.refund(order_id=row[1], amount=row[2], currency=row[3], reason="")
 
     channel = body["container"]["channel_id"]
-    client.chat_postMessage(channel=channel, text=f"Refund #{req_id} APPROVED by <@{user}>")
+    ts      = body["message"]["ts"]
+
+    if ok:
+        update_status(req_id, "SUCCEEDED")
+        client.chat_update(
+            channel=channel,
+            ts=ts,
+            text=f"Refund #{req_id} SUCCEEDED",
+            blocks=render_refund_blocks(req_id, row[1], row[2], "SUCCEEDED", decided_by=user)
+        )
+    else:
+        update_status(req_id, "FAILED")
+        client.chat_update(
+            channel=channel,
+            ts=ts,
+            text=f"Refund #{req_id} FAILED",
+            blocks=render_refund_blocks(req_id, row[1], row[2], "FAILED", decided_by=user)
+        )
+
 
 
 @app.action("refund_reject")
@@ -75,10 +105,18 @@ def on_reject(ack, body, action, client, respond):
     row = get_refund(req_id)
     if not row:
         return respond(text=f"Refund #{req_id} not found" )
+    
     update_status(req_id, "REJECTED")
 
     channel = body["container"]["channel_id"]
-    client.chat_postMessage(channel=channel, text=f"Refund #{req_id} REJECTED by <@{user}>")
+    ts      = body["message"]["ts"]
+
+    client.chat_update(
+        channel=channel,
+        ts=ts,
+        text=f"Refund #{req_id} REJECTED",
+        blocks=render_refund_blocks(req_id, row[1], row[2], "REJECTED", decided_by=user)
+    )
 
 
 @app.command("/refund")

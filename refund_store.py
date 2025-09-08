@@ -44,4 +44,4 @@ def update_status(req_id:int, status:str, approver_id:str|None=None):
 def get_refund(req_id:int):
     with _conn() as c:
         cur = c.execute("SELECT id, order_id, amount, currency, status FROM refund_requests WHERE id=?", (req_id,))
-        return cur.fetchone
+        return cur.fetchone()
