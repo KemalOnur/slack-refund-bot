@@ -35,6 +35,9 @@ services:
       - "24224:24224"        # forward input (opsiyonel dışarı açma)
     depends_on:
       - elasticsearch
+    networks:
+      logging_net:
+        ipv4_address: 172.30.0.10
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
@@ -45,16 +48,29 @@ services:
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
       - "9200:9200"
+    networks:
+      logging_net:
+        ipv4_address: 172.30.0.11
 
   kibana:
     image: docker.elastic.co/kibana/kibana:8.14.3
     container_name: kibana
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
     ports:
       - "5601:5601"
     depends_on:
       - elasticsearch
+    networks:
+      - logging_net
+
+networks:
+  logging_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   db-data:
